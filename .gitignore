@@ -1,0 +1,69 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Data
+data/
+*.zip
+*.tar.gz
+
+# Results
+results/
+*.csv
+*.pkl
+*.pickle
+
+# Plots
+*.png
+*.jpg
+*.pdf
+plots/
+
+# Logs
+*.log
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Papers (already extracted)
+*.pdf
+paper1.txt
+paper2.txt
+extract_pdf.py
