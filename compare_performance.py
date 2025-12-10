@@ -270,8 +270,7 @@ def main():
     # Load or create dataset
     if args.dataset:
         print(f"\nLoading dataset: {args.dataset}")
-        graphs, labels = load_tudataset(args.dataset)
-        num_classes = len(np.unique(labels))
+        graphs, labels, num_classes = load_tudataset(args.dataset)
         print(f"Loaded {len(graphs)} graphs with {num_classes} classes")
     else:
         graphs, labels = create_test_graphs(n_graphs=args.n_graphs)
