@@ -37,6 +37,9 @@ class VSGraphEncoder:
     n_jobs : int
         Number of parallel jobs for encoding graphs (default: -1, uses all CPU cores)
         Set to 1 for sequential processing
+    use_vectorization : bool
+        If True, use optimized vectorized operations (default: True)
+        Set to False to use original non-vectorized implementation for comparison
     """
     
     def __init__(
@@ -46,13 +49,15 @@ class VSGraphEncoder:
         message_passing_layers: int = 2,
         blend_factor: float = 0.5,
         seed: Optional[int] = None,
-        n_jobs: int = -1
+        n_jobs: int = -1,
+        use_vectorization: bool = True
     ):
         self.D = dimension
         self.K = diffusion_hops
         self.L = message_passing_layers
         self.alpha = blend_factor
         self.n_jobs = n_jobs if n_jobs != -1 else cpu_count()
+        self.use_vectorization = use_vectorization  # Feature flag for vectorization
 
         if seed is not None:
             np.random.seed(seed)
@@ -80,6 +85,37 @@ class VSGraphEncoder:
             self.basis_memory[rank] = np.random.randint(0, 2, size=self.D, dtype=np.int8)
         return self.basis_memory[rank]
     
+    def _spike_diffusion_original(self, graph: nx.Graph) -> np.ndarray:
+        """
+        Original (non-vectorized) spike diffusion implementation.
+        Used when use_vectorization=False for performance comparison.
+        """
+        n = graph.number_of_nodes()
+
+        # Initialize unit spikes (line 2)
+        spikes = np.ones(n, dtype=np.float64)
+
+        # Create adjacency list for efficient neighbor access
+        adj_list = {i: list(graph.neighbors(i)) for i in range(n)}
+
+        # Diffusion iterations (lines 3-8)
+        for hop in range(self.K):
+            new_spikes = np.zeros(n, dtype=np.float64)
+
+            # For each node, aggregate spikes from neighbors (lines 5-6)
+            for i in range(n):
+                for j in adj_list[i]:
+                    new_spikes[i] += spikes[j]
+
+            spikes = new_spikes
+
+        # Assign ranks based on spike values (line 9)
+        ranks = np.argsort(-spikes)  # Descending order
+        rank_array = np.empty(n, dtype=np.int32)
+        rank_array[ranks] = np.arange(n)
+
+        return rank_array
+
     def spike_diffusion(self, graph: nx.Graph) -> np.ndarray:
         """
         Perform spike diffusion to obtain topology-based node rankings.
@@ -99,6 +135,11 @@ class VSGraphEncoder:
         np.ndarray
             Rank array where ranks[i] is the rank of node i
         """
+        # Use original implementation if vectorization is disabled
+        if not self.use_vectorization:
+            return self._spike_diffusion_original(graph)
+
+        # Vectorized implementation
         n = graph.number_of_nodes()
 
         # Initialize unit spikes (line 2)
@@ -120,6 +161,39 @@ class VSGraphEncoder:
 
         return rank_array
     
+    def _associative_message_passing_original(
+        self,
+        graph: nx.Graph,
+        initial_hypervectors: np.ndarray
+    ) -> np.ndarray:
+        """
+        Original (non-optimized) message passing implementation.
+        Used when use_vectorization=False for performance comparison.
+        """
+        n = graph.number_of_nodes()
+
+        # Initialize with rank-based hypervectors (line 10-12)
+        h = initial_hypervectors.astype(np.float32)
+
+        # Create adjacency list
+        adj_list = {i: list(graph.neighbors(i)) for i in range(n)}
+
+        # Message passing layers (lines 13-19)
+        for layer in range(self.L):
+            messages = np.zeros((n, self.D), dtype=np.float32)
+
+            # Aggregate neighbors with logical OR (lines 15-16)
+            for i in range(n):
+                if len(adj_list[i]) > 0:
+                    # Logical OR: take max across neighbors for each dimension
+                    neighbor_hvs = h[adj_list[i]]
+                    messages[i] = np.max(neighbor_hvs, axis=0)
+
+            # Residual blend update (lines 17-18)
+            h = self.alpha * h + (1 - self.alpha) * messages
+
+        return h
+
     def associative_message_passing(
         self,
         graph: nx.Graph,
@@ -145,6 +219,11 @@ class VSGraphEncoder:
         np.ndarray
             Final node hypervectors after L layers, shape (n, D)
         """
+        # Use original implementation if vectorization is disabled
+        if not self.use_vectorization:
+            return self._associative_message_passing_original(graph, initial_hypervectors)
+
+        # Optimized implementation
         n = graph.number_of_nodes()
 
         # Initialize with rank-based hypervectors (line 10-12)
