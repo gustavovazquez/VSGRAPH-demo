@@ -14,12 +14,14 @@ import numpy as np
 import networkx as nx
 from typing import Dict, List, Tuple, Optional
 import time
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 
 class VSGraphEncoder:
     """
     VS-Graph encoder implementing spike diffusion and associative message passing.
-    
+
     Parameters
     ----------
     dimension : int
@@ -32,6 +34,9 @@ class VSGraphEncoder:
         Residual blend factor α ∈ [0,1] for message passing
     seed : int, optional
         Random seed for reproducibility
+    n_jobs : int
+        Number of parallel jobs for encoding graphs (default: -1, uses all CPU cores)
+        Set to 1 for sequential processing
     """
     
     def __init__(
@@ -40,16 +45,18 @@ class VSGraphEncoder:
         diffusion_hops: int = 3,
         message_passing_layers: int = 2,
         blend_factor: float = 0.5,
-        seed: Optional[int] = None
+        seed: Optional[int] = None,
+        n_jobs: int = -1
     ):
         self.D = dimension
         self.K = diffusion_hops
         self.L = message_passing_layers
         self.alpha = blend_factor
-        
+        self.n_jobs = n_jobs if n_jobs != -1 else cpu_count()
+
         if seed is not None:
             np.random.seed(seed)
-        
+
         # Initialize basis hypervectors for rank encoding
         # We'll create basis vectors on-demand based on max rank seen
         self.basis_memory: Dict[int, np.ndarray] = {}
@@ -76,47 +83,41 @@ class VSGraphEncoder:
     def spike_diffusion(self, graph: nx.Graph) -> np.ndarray:
         """
         Perform spike diffusion to obtain topology-based node rankings.
-        
+
         Algorithm 1, lines 2-9:
         - Initialize unit spikes s_i ← 1 for all nodes
         - For K hops: s_i ← Σ_{j∈N(i)} s_j
         - Rank nodes by final spike values
-        
+
         Parameters
         ----------
         graph : nx.Graph
             Input graph
-            
+
         Returns
         -------
         np.ndarray
             Rank array where ranks[i] is the rank of node i
         """
         n = graph.number_of_nodes()
-        
+
         # Initialize unit spikes (line 2)
         spikes = np.ones(n, dtype=np.float64)
-        
-        # Create adjacency list for efficient neighbor access
-        adj_list = {i: list(graph.neighbors(i)) for i in range(n)}
-        
-        # Diffusion iterations (lines 3-8)
+
+        # Get adjacency matrix as sparse matrix for vectorized operations
+        adj_matrix = nx.adjacency_matrix(graph, nodelist=range(n))
+
+        # Diffusion iterations using matrix multiplication (vectorized)
+        # new_spikes = A @ spikes (adjacency matrix times spike vector)
         for hop in range(self.K):
-            new_spikes = np.zeros(n, dtype=np.float64)
-            
-            # For each node, aggregate spikes from neighbors (lines 5-6)
-            for i in range(n):
-                for j in adj_list[i]:
-                    new_spikes[i] += spikes[j]
-            
-            spikes = new_spikes
-        
+            spikes = adj_matrix @ spikes
+
         # Assign ranks based on spike values (line 9)
         # Higher spike value → lower rank (0 is highest)
         ranks = np.argsort(-spikes)  # Descending order
         rank_array = np.empty(n, dtype=np.int32)
         rank_array[ranks] = np.arange(n)
-        
+
         return rank_array
     
     def associative_message_passing(
@@ -126,46 +127,50 @@ class VSGraphEncoder:
     ) -> np.ndarray:
         """
         Perform associative message passing with logical OR aggregation.
-        
+
         Algorithm 1, lines 13-19:
         - For L layers:
           - m_i^(l) = ∨_{j∈N(i)} h_j^(l)  (logical OR)
           - h_i^(l+1) = α·h_i^(l) + (1-α)·m_i^(l)  (residual blend)
-        
+
         Parameters
         ----------
         graph : nx.Graph
             Input graph
         initial_hypervectors : np.ndarray
             Initial node hypervectors from spike diffusion, shape (n, D)
-            
+
         Returns
         -------
         np.ndarray
             Final node hypervectors after L layers, shape (n, D)
         """
         n = graph.number_of_nodes()
-        
+
         # Initialize with rank-based hypervectors (line 10-12)
         h = initial_hypervectors.astype(np.float32)
-        
-        # Create adjacency list
-        adj_list = {i: list(graph.neighbors(i)) for i in range(n)}
-        
+
+        # Get adjacency matrix for vectorized operations
+        adj_matrix = nx.adjacency_matrix(graph, nodelist=range(n))
+
         # Message passing layers (lines 13-19)
         for layer in range(self.L):
+            # For each node, compute max of neighbors' hypervectors
             messages = np.zeros((n, self.D), dtype=np.float32)
-            
-            # Aggregate neighbors with logical OR (lines 15-16)
+
+            # Vectorized neighbor aggregation using sparse matrix
             for i in range(n):
-                if len(adj_list[i]) > 0:
+                # Get neighbors using adjacency matrix
+                # Convert sparse row to array and find non-zero indices
+                row = adj_matrix[i].toarray().flatten()
+                neighbors = np.nonzero(row)[0]
+                if len(neighbors) > 0:
                     # Logical OR: take max across neighbors for each dimension
-                    neighbor_hvs = h[adj_list[i]]
-                    messages[i] = np.max(neighbor_hvs, axis=0)
-            
+                    messages[i] = np.max(h[neighbors], axis=0)
+
             # Residual blend update (lines 17-18)
             h = self.alpha * h + (1 - self.alpha) * messages
-        
+
         return h
     
     def graph_level_readout(self, node_hypervectors: np.ndarray) -> np.ndarray:
@@ -225,17 +230,20 @@ class VSGraphEncoder:
         
         return graph_embedding
     
-    def encode_graphs(self, graphs: List[nx.Graph], verbose: bool = False) -> np.ndarray:
+    def encode_graphs(self, graphs: List[nx.Graph], verbose: bool = False, n_jobs: Optional[int] = None) -> np.ndarray:
         """
-        Encode multiple graphs.
-        
+        Encode multiple graphs with parallel processing support.
+
         Parameters
         ----------
         graphs : list of nx.Graph
             List of graphs to encode
         verbose : bool
             If True, print progress
-            
+        n_jobs : int, optional
+            Number of parallel jobs. If None, uses self.n_jobs.
+            Set to 1 for sequential processing.
+
         Returns
         -------
         np.ndarray
@@ -243,22 +251,61 @@ class VSGraphEncoder:
         """
         num_graphs = len(graphs)
         embeddings = np.zeros((num_graphs, self.D), dtype=np.float32)
-        
+
         start_time = time.time()
-        
-        for idx, graph in enumerate(graphs):
-            embeddings[idx] = self.encode_graph(graph)
-            
-            if verbose and (idx + 1) % 100 == 0:
-                elapsed = time.time() - start_time
-                avg_time = elapsed / (idx + 1) * 1000  # ms
-                print(f"Encoded {idx + 1}/{num_graphs} graphs "
-                      f"(avg: {avg_time:.2f} ms/graph)")
-        
+
+        # Determine number of workers
+        workers = n_jobs if n_jobs is not None else self.n_jobs
+
+        if workers == 1 or num_graphs < 10:
+            # Sequential processing for small datasets or when explicitly requested
+            for idx, graph in enumerate(graphs):
+                embeddings[idx] = self.encode_graph(graph)
+
+                if verbose and (idx + 1) % 100 == 0:
+                    elapsed = time.time() - start_time
+                    avg_time = elapsed / (idx + 1) * 1000  # ms
+                    print(f"Encoded {idx + 1}/{num_graphs} graphs "
+                          f"(avg: {avg_time:.2f} ms/graph)")
+        else:
+            # Parallel processing for larger datasets
+            if verbose:
+                print(f"Using {workers} parallel workers for encoding {num_graphs} graphs")
+
+            with Pool(processes=workers) as pool:
+                # Use imap for better progress tracking
+                results = pool.imap(self._encode_graph_wrapper, graphs)
+
+                for idx, embedding in enumerate(results):
+                    embeddings[idx] = embedding
+
+                    if verbose and (idx + 1) % 100 == 0:
+                        elapsed = time.time() - start_time
+                        avg_time = elapsed / (idx + 1) * 1000  # ms
+                        print(f"Encoded {idx + 1}/{num_graphs} graphs "
+                              f"(avg: {avg_time:.2f} ms/graph)")
+
         if verbose:
             total_time = time.time() - start_time
             avg_time = total_time / num_graphs * 1000
             print(f"Total encoding time: {total_time:.2f}s "
                   f"(avg: {avg_time:.3f} ms/graph)")
-        
+
         return embeddings
+
+    def _encode_graph_wrapper(self, graph: nx.Graph) -> np.ndarray:
+        """
+        Wrapper method for parallel encoding.
+        Needed because multiprocessing requires picklable functions.
+
+        Parameters
+        ----------
+        graph : nx.Graph
+            Graph to encode
+
+        Returns
+        -------
+        np.ndarray
+            Graph embedding
+        """
+        return self.encode_graph(graph)

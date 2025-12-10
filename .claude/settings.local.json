@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m venv:*)",
+      "Bash(venv\\Scripts\\python.exe:*)",
+      "Bash(./venv/Scripts/python.exe -m pip:*)",
+      "Bash(python test_parallel.py:*)",
+      "Bash(dir /b:*)",
+      "Bash(venvScriptspython.exe test_parallel.py)",
+      "Bash(./venv/Scripts/python.exe test_parallel.py)"
+    ]
+  }
+}

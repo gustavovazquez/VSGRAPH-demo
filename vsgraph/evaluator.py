@@ -10,6 +10,8 @@ import networkx as nx
 from typing import List, Tuple, Dict, Optional
 from sklearn.model_selection import StratifiedKFold
 import time
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 from vsgraph.encoder import VSGraphEncoder
 from vsgraph.classifier import PrototypeClassifier
@@ -18,7 +20,7 @@ from vsgraph.classifier import PrototypeClassifier
 class VSGraphEvaluator:
     """
     Evaluator for VS-Graph with k-fold cross-validation.
-    
+
     Parameters
     ----------
     encoder : VSGraphEncoder
@@ -29,6 +31,9 @@ class VSGraphEvaluator:
         Number of times to repeat CV (default: 3)
     seed : int, optional
         Random seed for reproducibility
+    n_jobs : int
+        Number of parallel jobs for fold processing (default: -1, uses all CPU cores)
+        Set to 1 to disable parallel fold processing
     """
     
     def __init__(
@@ -36,23 +41,77 @@ class VSGraphEvaluator:
         encoder: VSGraphEncoder,
         n_folds: int = 10,
         n_repeats: int = 3,
-        seed: Optional[int] = 42
+        seed: Optional[int] = 42,
+        n_jobs: int = -1
     ):
         self.encoder = encoder
         self.n_folds = n_folds
         self.n_repeats = n_repeats
         self.seed = seed
-    
+        self.n_jobs = n_jobs if n_jobs != -1 else cpu_count()
+
+    @staticmethod
+    def _evaluate_single_fold(fold_data: Tuple) -> Tuple[float, float, float]:
+        """
+        Evaluate a single fold. Static method for multiprocessing compatibility.
+
+        Parameters
+        ----------
+        fold_data : tuple
+            (train_graphs, test_graphs, train_labels, test_labels, encoder_params, num_classes)
+
+        Returns
+        -------
+        tuple
+            (accuracy, train_time_per_graph, inference_time_per_graph)
+        """
+        train_graphs, test_graphs, train_labels, test_labels, encoder_params, num_classes = fold_data
+
+        # Create encoder with provided parameters
+        encoder = VSGraphEncoder(**encoder_params)
+
+        # === TRAINING ===
+        train_start = time.time()
+
+        # Encode training graphs
+        train_embeddings = encoder.encode_graphs(train_graphs, verbose=False)
+
+        # Train classifier
+        classifier = PrototypeClassifier(num_classes=num_classes, normalize=True)
+        classifier.fit(train_embeddings, train_labels, verbose=False)
+
+        train_time = time.time() - train_start
+        train_time_per_graph = train_time / len(train_graphs) * 1000  # ms
+
+        # === INFERENCE ===
+        inference_start = time.time()
+
+        # Encode test graphs
+        test_embeddings = encoder.encode_graphs(test_graphs, verbose=False)
+
+        # Predict
+        predictions = classifier.predict(test_embeddings, verbose=False)
+
+        inference_time = time.time() - inference_start
+        inference_time_per_graph = inference_time / len(test_graphs) * 1000  # ms
+
+        # Compute accuracy
+        accuracy = np.mean(predictions == test_labels) * 100
+
+        return accuracy, train_time_per_graph, inference_time_per_graph
+
     def evaluate(
         self,
         graphs: List[nx.Graph],
         labels: np.ndarray,
         num_classes: int,
-        verbose: bool = True
+        verbose: bool = True,
+        n_jobs: Optional[int] = None,
+        parallel_folds: bool = True
     ) -> Dict:
         """
-        Perform k-fold cross-validation evaluation.
-        
+        Perform k-fold cross-validation evaluation with optional parallel fold processing.
+
         Parameters
         ----------
         graphs : list of nx.Graph
@@ -63,7 +122,12 @@ class VSGraphEvaluator:
             Number of classes
         verbose : bool
             If True, print progress
-            
+        n_jobs : int, optional
+            Number of parallel jobs for fold processing. If None, uses self.n_jobs.
+            Set to 1 to disable parallel fold processing.
+        parallel_folds : bool
+            If True, process CV folds in parallel. Default: True.
+
         Returns
         -------
         dict
@@ -72,16 +136,30 @@ class VSGraphEvaluator:
         all_accuracies = []
         all_train_times = []
         all_inference_times = []
-        
-        # Convert graphs to numpy array for easier indexing
-        graphs = np.array(graphs, dtype=object)
-        
+
+        # Keep graphs as list for proper indexing
+        if isinstance(graphs, np.ndarray):
+            graphs = graphs.tolist()
+        graphs_list = list(graphs)
+
+        # Determine number of workers
+        workers = n_jobs if n_jobs is not None else self.n_jobs
+
+        # Get encoder parameters for parallel processing
+        encoder_params = {
+            'dimension': self.encoder.D,
+            'diffusion_hops': self.encoder.K,
+            'message_passing_layers': self.encoder.L,
+            'blend_factor': self.encoder.alpha,
+            'n_jobs': 1  # Each fold worker processes graphs sequentially or with its own parallelization
+        }
+
         for repeat in range(self.n_repeats):
             if verbose:
                 print(f"\n{'='*60}")
                 print(f"Repeat {repeat + 1}/{self.n_repeats}")
                 print(f"{'='*60}")
-            
+
             # Create stratified k-fold splits
             seed = self.seed + repeat if self.seed is not None else None
             skf = StratifiedKFold(
@@ -89,65 +167,101 @@ class VSGraphEvaluator:
                 shuffle=True,
                 random_state=seed
             )
-            
+
+            # Create indices array for splitting
+            indices = np.arange(len(graphs_list))
+
             fold_accuracies = []
             fold_train_times = []
             fold_inference_times = []
-            
-            for fold_idx, (train_idx, test_idx) in enumerate(skf.split(graphs, labels)):
+
+            if parallel_folds and workers > 1:
+                # Parallel fold processing
                 if verbose:
-                    print(f"\nFold {fold_idx + 1}/{self.n_folds}")
-                
-                # Split data
-                train_graphs = graphs[train_idx].tolist()
-                test_graphs = graphs[test_idx].tolist()
-                train_labels = labels[train_idx]
-                test_labels = labels[test_idx]
-                
-                # === TRAINING ===
-                train_start = time.time()
-                
-                # Encode training graphs
-                train_embeddings = self.encoder.encode_graphs(
-                    train_graphs,
-                    verbose=False
-                )
-                
-                # Train classifier
-                classifier = PrototypeClassifier(
-                    num_classes=num_classes,
-                    normalize=True
-                )
-                classifier.fit(train_embeddings, train_labels, verbose=False)
-                
-                train_time = time.time() - train_start
-                train_time_per_graph = train_time / len(train_graphs) * 1000  # ms
-                fold_train_times.append(train_time_per_graph)
-                
-                # === INFERENCE ===
-                inference_start = time.time()
-                
-                # Encode test graphs
-                test_embeddings = self.encoder.encode_graphs(
-                    test_graphs,
-                    verbose=False
-                )
-                
-                # Predict
-                predictions = classifier.predict(test_embeddings, verbose=False)
-                
-                inference_time = time.time() - inference_start
-                inference_time_per_graph = inference_time / len(test_graphs) * 1000  # ms
-                fold_inference_times.append(inference_time_per_graph)
-                
-                # Compute accuracy
-                accuracy = np.mean(predictions == test_labels) * 100
-                fold_accuracies.append(accuracy)
-                
-                if verbose:
-                    print(f"  Accuracy: {accuracy:.2f}%")
-                    print(f"  Train time: {train_time_per_graph:.3f} ms/graph")
-                    print(f"  Inference time: {inference_time_per_graph:.3f} ms/graph")
+                    print(f"Using {min(workers, self.n_folds)} parallel workers for {self.n_folds} folds")
+
+                # Prepare fold data
+                fold_data_list = []
+                for fold_idx, (train_idx, test_idx) in enumerate(skf.split(indices, labels)):
+                    train_graphs = [graphs_list[i] for i in train_idx]
+                    test_graphs = [graphs_list[i] for i in test_idx]
+                    train_labels = labels[train_idx]
+                    test_labels = labels[test_idx]
+
+                    fold_data = (train_graphs, test_graphs, train_labels, test_labels, encoder_params, num_classes)
+                    fold_data_list.append(fold_data)
+
+                # Process folds in parallel
+                with Pool(processes=min(workers, self.n_folds)) as pool:
+                    results = pool.map(VSGraphEvaluator._evaluate_single_fold, fold_data_list)
+
+                # Collect results
+                for fold_idx, (accuracy, train_time_per_graph, inference_time_per_graph) in enumerate(results):
+                    fold_accuracies.append(accuracy)
+                    fold_train_times.append(train_time_per_graph)
+                    fold_inference_times.append(inference_time_per_graph)
+
+                    if verbose:
+                        print(f"\nFold {fold_idx + 1}/{self.n_folds}")
+                        print(f"  Accuracy: {accuracy:.2f}%")
+                        print(f"  Train time: {train_time_per_graph:.3f} ms/graph")
+                        print(f"  Inference time: {inference_time_per_graph:.3f} ms/graph")
+            else:
+                # Sequential fold processing
+                for fold_idx, (train_idx, test_idx) in enumerate(skf.split(indices, labels)):
+                    if verbose:
+                        print(f"\nFold {fold_idx + 1}/{self.n_folds}")
+
+                    # Split data
+                    train_graphs = [graphs_list[i] for i in train_idx]
+                    test_graphs = [graphs_list[i] for i in test_idx]
+                    train_labels = labels[train_idx]
+                    test_labels = labels[test_idx]
+
+                    # === TRAINING ===
+                    train_start = time.time()
+
+                    # Encode training graphs
+                    train_embeddings = self.encoder.encode_graphs(
+                        train_graphs,
+                        verbose=False
+                    )
+
+                    # Train classifier
+                    classifier = PrototypeClassifier(
+                        num_classes=num_classes,
+                        normalize=True
+                    )
+                    classifier.fit(train_embeddings, train_labels, verbose=False)
+
+                    train_time = time.time() - train_start
+                    train_time_per_graph = train_time / len(train_graphs) * 1000  # ms
+                    fold_train_times.append(train_time_per_graph)
+
+                    # === INFERENCE ===
+                    inference_start = time.time()
+
+                    # Encode test graphs
+                    test_embeddings = self.encoder.encode_graphs(
+                        test_graphs,
+                        verbose=False
+                    )
+
+                    # Predict
+                    predictions = classifier.predict(test_embeddings, verbose=False)
+
+                    inference_time = time.time() - inference_start
+                    inference_time_per_graph = inference_time / len(test_graphs) * 1000  # ms
+                    fold_inference_times.append(inference_time_per_graph)
+
+                    # Compute accuracy
+                    accuracy = np.mean(predictions == test_labels) * 100
+                    fold_accuracies.append(accuracy)
+
+                    if verbose:
+                        print(f"  Accuracy: {accuracy:.2f}%")
+                        print(f"  Train time: {train_time_per_graph:.3f} ms/graph")
+                        print(f"  Inference time: {inference_time_per_graph:.3f} ms/graph")
             
             # Aggregate fold results for this repeat
             repeat_accuracy = np.mean(fold_accuracies)
